@@ -5,6 +5,7 @@ Responsibilities:
 - Create and configure the FastAPI application.
 - Register API routers.
 - Install global exception handlers.
+- Configure CORS for frontend applications.
 - Expose health/readiness endpoints through routers.
 - Keep orchestration/business logic outside the web layer.
 
@@ -19,9 +20,10 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-# Routers (implemented separately)
+# Routers
 try:
     from app.api.routes_health import router as health_router
 except ImportError:
@@ -40,6 +42,7 @@ def create_app() -> FastAPI:
     environment-specific configuration without side effects
     at import time.
     """
+
     app = FastAPI(
         title="Plum Claims Processing System",
         description=(
@@ -53,6 +56,20 @@ def create_app() -> FastAPI:
     )
 
     # ------------------------------------------------------------------
+    # CORS
+    # ------------------------------------------------------------------
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # ------------------------------------------------------------------
     # Routers
     # ------------------------------------------------------------------
     if health_router:
@@ -61,12 +78,11 @@ def create_app() -> FastAPI:
             tags=["health"],
         )
 
-    if claims_router:
-        app.include_router(
-            claims_router,
-            prefix="/claims",
-            tags=["claims"],
-        )
+    app.include_router(
+        claims_router,
+        prefix="/claims",
+        tags=["claims"],
+    )
 
     # ------------------------------------------------------------------
     # Global exception handling
