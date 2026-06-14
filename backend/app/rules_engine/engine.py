@@ -9,7 +9,9 @@ coverage breakdown, etc.).
 Order of checks (each appends a TraceEntry regardless of pass/fail;
 the synthesizer decides what early-exits into REJECTED):
 
-1. Member lookup (MEMBER_NOT_FOUND if missing)
+1. Eligibility checks (RulesEngine.eligibility module):
+   member lookup (MEMBER_NOT_FOUND), policy active status
+   (POLICY_INACTIVE), dependent coverage (DEPENDENT_NOT_COVERED)
 2. Waiting period check
 3. Condition-level exclusion check
 4. Pre-authorization check
@@ -44,6 +46,11 @@ from app.models.documents import LineItem
 from app.models.decision import TraceEntry, TraceStatus, LineItemDecision
 from app.models.policy import PolicyTerms
 
+from app.rules_engine.eligibility import (
+    check_member_exists,
+    check_policy_active,
+    check_dependent_coverage,
+)
 from app.rules_engine.waiting_periods import check_waiting_period
 from app.rules_engine.exclusions import check_condition_exclusion, check_line_item_exclusions
 from app.rules_engine.preauth import check_pre_authorization
@@ -124,21 +131,23 @@ def evaluate(ctx: ClaimContext, policy: PolicyTerms) -> RulesEvaluationResult:
     result = RulesEvaluationResult()
     category = sub.claim_category.upper()
 
-    # --- Member lookup ---------------------------------------------------
-    member = policy.get_member(sub.member_id)
+    # --- Eligibility: member lookup, policy active, dependent coverage -----
+    member_entry, member = check_member_exists(sub.member_id, policy)
+    result.traces.append(member_entry)
     if member is None:
-        entry = TraceEntry(
-            stage="member_lookup",
-            component="RulesEngine.member_lookup",
-            status=TraceStatus.FAIL,
-            message=(
-                f"Member ID '{sub.member_id}' was not found in the policy "
-                f"member roster. This claim cannot be processed."
-            ),
-            details={"member_id": sub.member_id},
-        )
-        result.traces.append(entry)
-        result.hard_rejections.append(("MEMBER_NOT_FOUND", entry))
+        result.hard_rejections.append(("MEMBER_NOT_FOUND", member_entry))
+        return result
+
+    policy_active_entry = check_policy_active(sub.treatment_date, policy)
+    result.traces.append(policy_active_entry)
+    if policy_active_entry.status == TraceStatus.FAIL:
+        result.hard_rejections.append(("POLICY_INACTIVE", policy_active_entry))
+        return result
+
+    dependent_entry = check_dependent_coverage(member, policy)
+    result.traces.append(dependent_entry)
+    if dependent_entry.status == TraceStatus.FAIL:
+        result.hard_rejections.append(("DEPENDENT_NOT_COVERED", dependent_entry))
         return result
 
     diagnosis_text, treatment_text, tests_ordered, line_items, bill_total = _gather_text_fields(ctx)
