@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, status
 from app.models.claim import ClaimSubmission
 from app.orchestrator.pipeline import run_claim_pipeline
 from app.policy_loader import load_policy
+from app.utils.confidence import calculate_pipeline_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ async def submit_claim(
                 if ctx.decision
                 else None
             ),
+            "confidence_score": round(calculate_pipeline_confidence(ctx), 2),
             "trace": [
                 trace.model_dump()
                 for trace in ctx.trace
@@ -97,6 +99,9 @@ async def submit_claim(
             "degraded": ctx.degraded,
             "fraud_score": ctx.fraud_score,
             "fraud_signals": ctx.fraud_signals,
+            "blocked": ctx.blocked,
+            "block_code": ctx.block_code,
+            "block_message": ctx.block_message,
         }
 
         CLAIMS_DB[claim_id] = result

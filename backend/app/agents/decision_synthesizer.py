@@ -9,14 +9,16 @@ Combines:
 ...into a final ClaimDecision: decision status, approved_amount, reasons,
 rejection_reasons, line_items, confidence_score, notes.
 
-Confidence formula (documented here as the single source of truth)
+Confidence formula (documented in full in app.utils.confidence)
 ---------------------------------------------------------------------
-base_confidence = 0.95
-
-confidence = base_confidence
-            + sum(t.confidence_impact for t in ctx.trace)   # agent-reported deltas
-            * (1 - fraud_score * 0.3)                         # fraud dampening
-clamped to [0.0, 1.0]
+calculate_pipeline_confidence(ctx) is the single source of truth:
+  - starts from the average per-document extraction confidence (or
+    1.0 - 0.30 = 0.70 if no documents were extracted)
+  - -0.10 per FAILED document extraction
+  - -0.20 if the pipeline is degraded (a component failed and was skipped)
+  - -(fraud_score * 0.20) for fraud/anomaly risk
+  - capped at 0.40 if the claim is blocked
+  - clamped to [0.0, 1.0]
 
 Decision logic
 --------------
@@ -60,14 +62,12 @@ from app.models.claim import ClaimContext
 from app.models.decision import ClaimDecision, DecisionStatus, TraceEntry, TraceStatus
 from app.models.policy import PolicyTerms
 from app.rules_engine.engine import RulesEvaluationResult
+from app.utils.confidence import calculate_pipeline_confidence
 
 
 class DecisionSynthesizerAgent(BaseAgent):
     name = "DecisionSynthesizerAgent"
     stage = "decision_synthesis"
-
-    BASE_CONFIDENCE = 0.95
-    FRAUD_DAMPENING_FACTOR = 0.3
 
     def __init__(self, policy: PolicyTerms, rules_result: RulesEvaluationResult):
         self.policy = policy
@@ -98,8 +98,14 @@ class DecisionSynthesizerAgent(BaseAgent):
             return ctx
 
         # 2. Fraud routing ------------------------------------------------------
+        # ANY detected anomaly signal (e.g. unusual same-day claim
+        # frequency) routes to manual review rather than letting the
+        # claim auto-approve/auto-reject. fraud_score crossing the
+        # configured threshold, or the claimed amount exceeding
+        # auto_manual_review_above, are additional independent triggers.
         fraud_triggered = (
-            ctx.fraud_score >= thresholds.fraud_score_manual_review_threshold
+            bool(ctx.fraud_signals)
+            or ctx.fraud_score >= thresholds.fraud_score_manual_review_threshold
             or sub.claimed_amount > thresholds.auto_manual_review_above
         )
         if fraud_triggered:
@@ -158,6 +164,14 @@ class DecisionSynthesizerAgent(BaseAgent):
         approved = rr.approved_amount
         any_line_item_rejected = any(li.status == "REJECTED" for li in rr.line_item_decisions)
 
+        # PARTIAL means the policy excluded some of what was *claimed*
+        # (line-item exclusions) or capped the *eligible base amount*
+        # itself (annual headroom). Normal network-discount / co-pay
+        # arithmetic applied to the full eligible amount is the expected
+        # contractual reduction for an APPROVED claim, not a partial denial.
+        eligible_base = rr.coverage_breakdown.get("base_amount", sub.claimed_amount)
+        base_was_reduced = eligible_base < sub.claimed_amount
+
         if approved <= 0:
             decision = ClaimDecision(
                 decision=DecisionStatus.REJECTED,
@@ -169,7 +183,7 @@ class DecisionSynthesizerAgent(BaseAgent):
                 breakdown=rr.coverage_breakdown,
                 confidence_score=confidence,
             )
-        elif any_line_item_rejected or approved < sub.claimed_amount:
+        elif any_line_item_rejected or base_was_reduced:
             decision = ClaimDecision(
                 decision=DecisionStatus.PARTIAL,
                 claimed_amount=sub.claimed_amount,
@@ -197,16 +211,7 @@ class DecisionSynthesizerAgent(BaseAgent):
         return ctx
 
     def _compute_confidence(self, ctx: ClaimContext) -> float:
-        confidence = self.BASE_CONFIDENCE
-        for t in ctx.trace:
-            confidence += t.confidence_impact
-        # extraction confidence: average across documents, if any
-        if ctx.extractions:
-            avg_extraction_conf = sum(e.confidence for e in ctx.extractions) / len(ctx.extractions)
-            confidence = confidence * (0.5 + 0.5 * avg_extraction_conf)
-        fraud_dampening = 1 - (ctx.fraud_score * self.FRAUD_DAMPENING_FACTOR)
-        confidence *= fraud_dampening
-        return round(max(0.0, min(1.0, confidence)), 2)
+        return round(calculate_pipeline_confidence(ctx), 2)
 
     def _build_notes(self, rr: RulesEvaluationResult) -> str:
         b = rr.coverage_breakdown

@@ -4,6 +4,10 @@ Pipeline orchestrator.
 run_claim_pipeline(submission: ClaimSubmission, policy: PolicyTerms) -> ClaimContext
 
 Stages, in order:
+  0. DocumentClassifierAgent -> infers doc.actual_type for any uploaded
+                                document that doesn't already have one
+                                (live uploads). Never overwrites a
+                                pre-supplied actual_type (eval harness).
   1. DocumentVerifierAgent  -> may set ctx.blocked=True and short-circuit
   2. ExtractionAgent        -> ctx.extractions (may raise -> degraded)
   3. RulesEngine.evaluate() -> RulesEvaluationResult (pure function, not
@@ -27,6 +31,7 @@ from app.models.claim import ClaimContext, ClaimSubmission
 from app.models.decision import ClaimDecision, DecisionStatus, TraceEntry, TraceStatus
 from app.models.policy import PolicyTerms
 
+from app.agents.document_classifier import DocumentClassifierAgent
 from app.agents.document_verifier import DocumentVerifierAgent
 from app.agents.extractor import ExtractionAgent
 from app.agents.fraud_detector import FraudDetectorAgent
@@ -36,6 +41,10 @@ from app.rules_engine.engine import evaluate as evaluate_rules, RulesEvaluationR
 
 def run_claim_pipeline(submission: ClaimSubmission, policy: PolicyTerms, llm_client=None) -> ClaimContext:
     ctx = ClaimContext(submission=submission)
+
+    # --- Stage 0: Document classification (infer actual_type for live uploads) ---
+    classifier = DocumentClassifierAgent(llm_client=llm_client)
+    ctx = classifier.run_safe(ctx)
 
     # --- Stage 1: Document verification (can short-circuit) -----------------
     doc_verifier = DocumentVerifierAgent(policy)
