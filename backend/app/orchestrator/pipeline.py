@@ -1,127 +1,340 @@
 """
 Pipeline orchestrator.
 
-run_claim_pipeline(submission: ClaimSubmission, policy: PolicyTerms) -> ClaimContext
+Supports:
 
-Stages, in order:
-  0. DocumentClassifierAgent -> infers doc.actual_type for any uploaded
-                                document that doesn't already have one
-                                (live uploads). Never overwrites a
-                                pre-supplied actual_type (eval harness).
-  1. DocumentVerifierAgent  -> may set ctx.blocked=True and short-circuit
-  2. ExtractionAgent        -> ctx.extractions (may raise -> degraded)
-  3. RulesEngine.evaluate() -> RulesEvaluationResult (pure function, not
-                                an agent; wrapped in try/except here so a
-                                bug in rules logic degrades rather than 500s)
-  4. FraudDetectorAgent     -> ctx.fraud_score, ctx.fraud_signals
-  5. DecisionSynthesizerAgent -> ctx.decision
+1. Evaluation Mode
+   - test_cases.json
+   - actual_type/content supplied directly
 
-If ctx.blocked is set by stage 1, stages 2-5 are skipped entirely and
-the orchestrator returns immediately -- per requirement #2 ("the system
-must stop immediately").
-
-If any later stage raises unexpectedly (caught by run_safe or the
-try/except around RulesEngine.evaluate), the orchestrator still reaches
-stage 5, which is responsible for producing a sensible decision (or a
-MANUAL_REVIEW fallback if even synthesis fails).
+2. Production Mode
+   - PDF/JPG/PNG upload
+   - Gemini Vision extraction
+   - OCR
 """
+
 from __future__ import annotations
 
-from app.models.claim import ClaimContext, ClaimSubmission
-from app.models.decision import ClaimDecision, DecisionStatus, TraceEntry, TraceStatus
+from app.models.claim import (
+    ClaimContext,
+    ClaimSubmission,
+)
+from app.models.decision import (
+    ClaimDecision,
+    DecisionStatus,
+    TraceEntry,
+    TraceStatus,
+)
 from app.models.policy import PolicyTerms
 
-from app.agents.document_classifier import DocumentClassifierAgent
-from app.agents.document_verifier import DocumentVerifierAgent
-from app.agents.extractor import ExtractionAgent
-from app.agents.fraud_detector import FraudDetectorAgent
-from app.agents.decision_synthesizer import DecisionSynthesizerAgent
-from app.rules_engine.engine import evaluate as evaluate_rules, RulesEvaluationResult
+from app.agents.document_classifier import (
+    DocumentClassifierAgent,
+)
+from app.agents.document_verifier import (
+    DocumentVerifierAgent,
+)
+from app.agents.extractor import (
+    ExtractionAgent,
+)
+from app.agents.fraud_detector import (
+    FraudDetectorAgent,
+)
+from app.agents.decision_synthesizer import (
+    DecisionSynthesizerAgent,
+)
+
+from app.rules_engine.engine import (
+    evaluate as evaluate_rules,
+    RulesEvaluationResult,
+)
+
+from app.llm.client import LLMClient
 
 
-def run_claim_pipeline(submission: ClaimSubmission, policy: PolicyTerms, llm_client=None) -> ClaimContext:
-    ctx = ClaimContext(submission=submission)
+def run_claim_pipeline(
+    submission: ClaimSubmission,
+    policy: PolicyTerms,
+    llm_client=None,
+) -> ClaimContext:
+    """
+    Main orchestration pipeline.
+    """
 
-    # --- Stage 0: Document classification (infer actual_type for live uploads) ---
-    classifier = DocumentClassifierAgent(llm_client=llm_client)
+    # ------------------------------------------------------------------
+    # Create shared context
+    # ------------------------------------------------------------------
+
+    ctx = ClaimContext(
+        submission=submission
+    )
+
+    # ------------------------------------------------------------------
+    # Production mode:
+    # initialize Gemini automatically
+    # ------------------------------------------------------------------
+
+    if llm_client is None:
+        try:
+            llm_client = LLMClient()
+
+            print("✅ Gemini initialized successfully")
+
+            ctx.processing_metadata[
+                "llm_enabled"
+            ] = True
+
+            ctx.processing_metadata[
+                "llm_model"
+            ] = getattr(
+                llm_client,
+                "model_name",
+                "unknown",
+            )
+
+        except Exception as exc:
+
+            print(
+                f"❌ LLM INIT FAILED: {exc}"
+            )
+
+            llm_client = None
+
+            ctx.processing_metadata[
+                "llm_enabled"
+            ] = False
+
+            ctx.processing_metadata[
+                "llm_error"
+            ] = str(exc)
+    # ------------------------------------------------------------------
+    # Stage 0
+    # Document Classification
+    # ------------------------------------------------------------------
+
+    classifier = DocumentClassifierAgent(
+        llm_client=llm_client
+    )
+
     ctx = classifier.run_safe(ctx)
 
-    # --- Stage 1: Document verification (can short-circuit) -----------------
-    doc_verifier = DocumentVerifierAgent(policy)
-    ctx = doc_verifier.run_safe(ctx)
+    # ------------------------------------------------------------------
+    # Stage 1
+    # Document Verification
+    # ------------------------------------------------------------------
+
+    verifier = DocumentVerifierAgent(
+        policy
+    )
+
+    ctx = verifier.run_safe(ctx)
 
     if ctx.blocked:
         return ctx
 
-    if not ctx.document_check_passed and ctx.degraded:
-        # DocumentVerifierAgent itself failed unexpectedly (e.g. unknown
-        # category). Continue cautiously rather than block the member,
-        # but flag heavily for manual review later.
+    if (
+        not ctx.document_check_passed
+        and ctx.degraded
+    ):
         ctx.add_trace(
             TraceEntry(
                 stage="document_verification",
                 component="Orchestrator",
                 status=TraceStatus.WARNING,
                 message=(
-                    "Document verification could not complete normally; "
-                    "proceeding with reduced confidence and flagging for "
-                    "manual review."
+                    "Document verification could "
+                    "not complete normally. "
+                    "Proceeding with reduced "
+                    "confidence."
                 ),
             )
         )
 
-    # --- Stage 2: Extraction --------------------------------------------------
-    extractor = ExtractionAgent(llm_client=llm_client)
+    # ------------------------------------------------------------------
+    # Stage 2
+    # Extraction (Gemini Vision)
+    # ------------------------------------------------------------------
+
+    print(
+        "LLM CLIENT:",
+        type(llm_client).__name__
+        if llm_client
+        else None
+    )
+
+    extractor = ExtractionAgent(
+        llm_client=llm_client
+    )
+
     ctx = extractor.run_safe(ctx)
 
-    # --- Stage 3: Rules engine (deterministic, pure function) ------------------
+    # ------------------------------------------------------------------
+    # Populate extracted summary fields
+    # ------------------------------------------------------------------
+
+    for extraction in ctx.extractions:
+
+        fields = (
+            extraction.extracted_fields
+            or {}
+        )
+
+        if (
+            not ctx.extracted_patient_name
+            and fields.get("patient_name")
+        ):
+            ctx.extracted_patient_name = (
+                fields.get("patient_name")
+            )
+
+        if (
+            not ctx.extracted_diagnosis
+            and fields.get("diagnosis")
+        ):
+            ctx.extracted_diagnosis = (
+                fields.get("diagnosis")
+            )
+
+        if (
+            not ctx.extracted_treatment
+            and fields.get("treatment")
+        ):
+            ctx.extracted_treatment = (
+                fields.get("treatment")
+            )
+
+        if (
+            ctx.extracted_total_amount
+            is None
+            and fields.get("total")
+        ):
+            try:
+                ctx.extracted_total_amount = float(
+                    fields.get("total")
+                )
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Rules Engine
+    # ------------------------------------------------------------------
+
     try:
-        rules_result = evaluate_rules(ctx, policy)
-    except Exception as exc:  # noqa: BLE001
+
+        rules_result = evaluate_rules(
+            ctx,
+            policy,
+        )
+
+    except Exception as exc:
+
         ctx.degraded = True
+
         ctx.add_trace(
             TraceEntry(
                 stage="rules_evaluation",
                 component="RulesEngine",
                 status=TraceStatus.FAIL,
                 message=(
-                    f"Rules engine failed unexpectedly and was skipped: {exc}. "
-                    f"Pipeline continued without a coverage calculation."
+                    "Rules engine failed "
+                    f"unexpectedly: {exc}"
                 ),
-                details={"error": str(exc), "error_type": type(exc).__name__},
+                details={
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
                 confidence_impact=-0.3,
             )
         )
-        rules_result = RulesEvaluationResult()
-    else:
-        ctx.trace.extend(rules_result.traces)
 
-    # --- Stage 4: Fraud detection ----------------------------------------------
-    fraud_detector = FraudDetectorAgent(policy)
+        rules_result = (
+            RulesEvaluationResult()
+        )
+
+    else:
+
+        ctx.trace.extend(
+            rules_result.traces
+        )
+
+    # ------------------------------------------------------------------
+    # Fraud Detection
+    # ------------------------------------------------------------------
+
+    fraud_detector = FraudDetectorAgent(
+        policy
+    )
+
     ctx = fraud_detector.run_safe(ctx)
 
-    # --- Stage 5: Decision synthesis --------------------------------------------
-    synthesizer = DecisionSynthesizerAgent(policy, rules_result)
+    # ------------------------------------------------------------------
+    # Decision Synthesis
+    # ------------------------------------------------------------------
+
+    synthesizer = (
+        DecisionSynthesizerAgent(
+            policy,
+            rules_result,
+        )
+    )
+
     ctx = synthesizer.run_safe(ctx)
 
+    # ------------------------------------------------------------------
+    # Final safety net
+    # ------------------------------------------------------------------
+
     if ctx.decision is None:
-        # Synthesizer itself failed -- final safety net.
+
         ctx.decision = ClaimDecision(
             decision=DecisionStatus.MANUAL_REVIEW,
-            claimed_amount=submission.claimed_amount,
+            claimed_amount=(
+                submission.claimed_amount
+            ),
             approved_amount=0,
-            reasons=["Automated decision synthesis failed; routed to manual review."],
+            reasons=[
+                (
+                    "Automated decision "
+                    "synthesis failed."
+                )
+            ],
             confidence_score=0.1,
             manual_review_recommended=True,
-            notes="DecisionSynthesizerAgent failed; see trace for details.",
+            notes=(
+                "Fallback decision "
+                "generated by orchestrator."
+            ),
         )
+
         ctx.add_trace(
             TraceEntry(
                 stage="decision_synthesis",
                 component="Orchestrator",
                 status=TraceStatus.FAIL,
-                message="Decision synthesis failed; returned MANUAL_REVIEW fallback.",
+                message=(
+                    "Decision synthesis failed; "
+                    "returned MANUAL_REVIEW."
+                ),
             )
         )
+
+    # ------------------------------------------------------------------
+    # Metadata
+    # ------------------------------------------------------------------
+
+    ctx.processing_metadata.update(
+        {
+            "documents_received": len(
+                submission.documents
+            ),
+            "documents_extracted": len(
+                ctx.extractions
+            ),
+            "fraud_score": ctx.fraud_score,
+            "pipeline_version": "2.0",
+            "llm_enabled": (
+                llm_client is not None
+            ),
+        }
+    )
 
     return ctx

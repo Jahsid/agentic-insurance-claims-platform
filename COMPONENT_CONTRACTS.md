@@ -20,41 +20,32 @@ The goal is to make each component independently replaceable.
 
 ## Responsibility
 
-Determine document type for uploaded documents that do not already have a known type.
-
-Runs before document verification.
-
-Examples:
-
-* Prescription
-* Hospital Bill
-* Lab Report
-* Discharge Summary
-
----
+Determine document type for uploaded files that do not already carry a known type. Runs at the absolute entry point of the live-upload pipeline.
 
 ## Input
 
 ```python
 ClaimContext
+
 ```
 
 Required fields:
 
 ```python
 ctx.submission.documents
+
 ```
 
-Each document may contain:
+Each document contains:
 
 ```python
-file_id
-file_name
-content
-actual_type
-```
+file_id        # Unique structural tracking UUID
+file_name      # User upload string name (e.g., 'prescription.pdf')
+mime_type      # Detected content envelope type
+file_path      # Destination path target in 'storage/uploads/'
+content        # Null for live path; dict for ground-truth passthrough
 
----
+```
 
 ## Output
 
@@ -62,36 +53,14 @@ Mutates:
 
 ```python
 document.actual_type
+
 ```
 
-Possible values:
-
-```python
-PRESCRIPTION
-HOSPITAL_BILL
-PHARMACY_BILL
-LAB_REPORT
-DIAGNOSTIC_REPORT
-DISCHARGE_SUMMARY
-DENTAL_REPORT
-UNKNOWN
-```
-
-Adds trace entries.
-
----
+Possible values: `PRESCRIPTION`, `HOSPITAL_BILL`, `PHARMACY_BILL`, `LAB_REPORT`, `DIAGNOSTIC_REPORT`, `DISCHARGE_SUMMARY`, `DENTAL_REPORT`, `UNKNOWN`. Appends localized trace entries.
 
 ## Failure Behavior
 
-Classification failure:
-
-```python
-actual_type = UNKNOWN
-```
-
-Pipeline continues.
-
-Confidence reduced.
+Classification exception defaults the document to `UNKNOWN`. Pipeline continues uninterrupted with an internal trace warning log recorded.
 
 ---
 
@@ -99,111 +68,48 @@ Confidence reduced.
 
 ## Responsibility
 
-Validate uploaded documents before any extraction or policy evaluation.
-
-Runs immediately after classification.
-
----
+Validate uploaded documents against physical readability, completeness, and matching identity constraints before extraction or calculations occur.
 
 ## Input
 
 ```python
 ClaimContext
 PolicyTerms
+
 ```
 
-Required:
+Required fields:
 
 ```python
 submission.claim_category
 submission.documents
 policy.document_requirements
-```
 
----
+```
 
 ## Checks
 
-### Required Documents
-
-Verify mandatory document types exist.
-
-Example:
-
-```text
-Hospital Bill required
-Prescription uploaded
-```
-
-Result:
-
-```text
-BLOCKED
-```
-
----
-
-### Readability
-
-Verify documents are readable.
-
-Example:
-
-```text
-Blurry hospital bill
-```
-
-Result:
-
-```text
-BLOCKED
-```
-
----
-
-### Patient Consistency
-
-Verify all documents belong to the same person.
-
-Example:
-
-```text
-Bill -> Rahul
-Prescription -> Amit
-```
-
-Result:
-
-```text
-BLOCKED
-```
-
----
+* **Required Documents**: Compares uploaded types against `policy_terms.json -> document_requirements[category]`. Rejects with a descriptive block message if structural files are missing.
+* **Readability**: Verifies files are readable and non-corrupt. If flagged `UNREADABLE`, blocks the route for that specific file token without crashing sibling uploads.
+* **Patient Consistency**: Flags a hard block if documents reflect different patient names, tracking both names dynamically.
 
 ## Output
 
 Mutates:
 
 ```python
-ctx.document_check_passed
-ctx.blocked
-ctx.block_code
-ctx.block_message
+ctx.document_check_passed  # boolean flag
+ctx.blocked                # boolean flag
+ctx.block_code             # string category code
+ctx.block_message          # string explanatory message
+
 ```
 
-Adds trace entries.
-
----
+Appends localized validation metrics into the trace context array.
 
 ## Failure Behavior
 
-Unexpected verification errors:
-
-```python
-ctx.degraded = True
-```
-
-Pipeline continues.
+Any validation failure instantly switches `ctx.blocked = True`, sets a strict confidence score cap of `0.40`, updates the corresponding trace step, and **halts pipeline execution immediately**. Unexpected execution crashes flip `ctx.degraded = True` and continue processing gracefully.
 
 ---
 
@@ -211,23 +117,21 @@ Pipeline continues.
 
 ## Responsibility
 
-Convert medical documents into structured information.
-
----
+Convert raw unstructured documents into standardized fields (diagnoses, treatments, line items, totals).
 
 ## Input
 
 ```python
 ClaimContext
+
 ```
 
-Required:
+Required fields:
 
 ```python
 submission.documents
-```
 
----
+```
 
 ## Output
 
@@ -235,68 +139,32 @@ Produces:
 
 ```python
 ctx.extractions
+
 ```
 
-Type:
-
-```python
-list[DocumentExtractionResult]
-```
-
-Each result contains:
+Type: `list[DocumentExtractionResult]`
+Each result structural entity contains:
 
 ```python
 file_id
 document_type
-extracted_fields
-confidence
-quality_flags
-extraction_status
-```
+extracted_fields     # Structured data dictionary
+confidence           # Floating point threshold [0.0, 1.0]
+quality_flags        # Array of string annotations (e.g., 'MISSING_FIELD')
+extraction_status    # 'OK', 'PARTIAL', or 'FAILED'
+error                # Exception string track or Null
 
----
+```
 
 ## Extraction Modes
 
-### Passthrough
-
-Used by evaluation harness.
-
-Reads:
-
-```python
-document.content
-```
-
-directly.
-
----
-
-### Gemini Extraction
-
-Used for live uploads.
-
-Calls:
-
-```python
-LLMClient.extract_document()
-```
-
----
+1. **Passthrough**: Utilized by the evaluation test harness. Reads `document.content` data parameters directly with a static 0.95 confidence rating.
+2. **Gemini Live Extraction**: Utilized for production file uploads. Orchestrates remote analysis via `LLMClient.extract_document(doc)`.
 
 ## Failure Behavior
 
-Extraction failure:
-
-```python
-extraction_status = FAILED
-```
-
-Pipeline continues.
-
-Trace recorded.
-
-Confidence reduced.
+* **Transient Outages**: Leverages a built-in exponential backoff loop that intercepts upstream `503 Service Unavailable` high-demand exceptions, retrying calls up to 3 times sequentially.
+* **Hard Failures**: If retries are fully exhausted or validation constraints fail, the item is marked `extraction_status = "FAILED"`, a confidence rating penalty is calculated, and the rules engine safely falls back to processing metadata parameters input from the frontend fields.
 
 ---
 
@@ -304,80 +172,56 @@ Confidence reduced.
 
 ## Responsibility
 
-Evaluate insurance policy coverage.
-
-Pure deterministic component.
-
-No LLM usage.
-
----
+Evaluate policy parameters, waiting timelines, limits, exclusions, and co-pay arithmetic. Pure deterministic component isolated from LLM reasoning.
 
 ## Input
 
 ```python
 ClaimContext
 PolicyTerms
+
 ```
 
-Required:
+Required fields:
 
 ```python
-member information
-claim category
-extracted fields
-policy configuration
-```
+member information       # Pulled from context
+claim_category           # E.g., 'CONSULTATION'
+extracted_fields         # Core dictionary inputs generated by Stage 2
+policy configuration     # Single source of truth loaded from policy_terms.json
 
----
+```
 
 ## Evaluates
 
-Coverage eligibility
-
-Waiting periods
-
-Copay
-
-Exclusions
-
-Coverage limits
-
-Sub-limits
-
-Network requirements
-
-Pre-authorization requirements
-
----
+1. Member eligibility and active coverage windows.
+2. Condition-specific waiting periods matched via string keyword lookups.
+3. Condition-level and line-item policy exclusions.
+4. Pre-authorization minimum transaction threshold approvals.
+5. Post-exclusion eligible financial limits, sub-limits, and overall annual OPD ceilings.
+6. Network discount percentage deduction logic followed by co-pay calculations.
 
 ## Output
 
 ```python
 RulesEvaluationResult
+
 ```
 
 Contains:
 
 ```python
-approved_amount
-rejection_reasons
-traces
-line_items
-```
+approved_amount      # Final numeric balance payable
+rejection_reasons    # Deduplicated list of all violated codes
+traces               # Logical execution check logs
+line_items           # Per-item approval structures (crucial for PARTIAL states)
+breakdown            # Detailed math audit trail dictionary
 
----
+```
 
 ## Failure Behavior
 
-Rules exception:
-
-```python
-ctx.degraded = True
-```
-
-Pipeline continues.
-
-Manual review may be triggered.
+Unhandled rule logic execution runtime errors set `ctx.degraded = True`, drop an execution penalty directly from the pipeline confidence score, log a `FAIL` status trace entry, and bypass directly to synthesis to process fallbacks.
 
 ---
 
@@ -385,53 +229,29 @@ Manual review may be triggered.
 
 ## Responsibility
 
-Identify suspicious claims.
-
----
+Analyze historical submission timelines and financial parameters against global transaction safety limits.
 
 ## Input
 
 ```python
 ClaimContext
 PolicyTerms
-```
 
----
+```
 
 ## Output
 
 Produces:
 
 ```python
-ctx.fraud_score
-ctx.fraud_signals
+ctx.fraud_score      # Numeric calculation metric
+ctx.fraud_signals    # Array of strings tracking metrics (e.g., 'HIGH_AMOUNT')
+
 ```
-
-Example:
-
-```python
-fraud_score = 0.85
-```
-
-Signals:
-
-```python
-HIGH_AMOUNT
-MULTIPLE_CLAIMS
-OUT_OF_NETWORK
-```
-
----
 
 ## Failure Behavior
 
-Fraud detection failure:
-
-```python
-ctx.degraded = True
-```
-
-Pipeline continues.
+If internal execution fails, logs a step exception trace entry, toggles `ctx.degraded = True`, and continues execution unhindered. **Any successfully triggered fraud signal dynamically forces the final decision target type to `MANUAL_REVIEW**`.
 
 ---
 
@@ -439,11 +259,7 @@ Pipeline continues.
 
 ## Responsibility
 
-Generate final claim decision.
-
-Consumes outputs from all previous stages.
-
----
+Synthesize rules metrics, fraud flags, and aggregate pipeline reliability into an immutable final settlement output.
 
 ## Input
 
@@ -451,61 +267,28 @@ Consumes outputs from all previous stages.
 ClaimContext
 RulesEvaluationResult
 PolicyTerms
-```
 
----
+```
 
 ## Decision Types
 
-```python
-APPROVED
-PARTIAL
-REJECTED
-MANUAL_REVIEW
-```
-
----
+* `APPROVED`: Post-adjudication eligible balance is greater than 0, with zero hard-rule violations and zero fraud alerts.
+* `PARTIAL`: Individual line items were excluded or the eligible base amount was constrained by a policy cap.
+* `REJECTED`: One or more deterministic hard rules failed compliance.
+* `MANUAL_REVIEW`: Anomalies were triggered, fraud scores were breached, or a pipeline degradation occurred.
 
 ## Output
 
 Produces:
 
 ```python
-ctx.decision
+ctx.decision # Instantiated ClaimDecision Pydantic object
+
 ```
-
-Type:
-
-```python
-ClaimDecision
-```
-
-Contains:
-
-```python
-decision
-approved_amount
-confidence_score
-reasons
-rejection_reasons
-line_items
-manual_review_recommended
-notes
-```
-
----
 
 ## Failure Behavior
 
-If synthesis fails:
-
-```python
-MANUAL_REVIEW
-```
-
-is returned.
-
-Pipeline never crashes.
+If synthesis logic drops an exception at runtime, the boundary catches it and forces an absolute safe-fallback output of `MANUAL_REVIEW` with an overall baseline confidence metric of `0.10`. The pipeline never crashes.
 
 ---
 
@@ -513,64 +296,36 @@ Pipeline never crashes.
 
 ## Responsibility
 
-Encapsulate Gemini interactions.
-
-Provides a stable interface between business logic and AI models.
-
----
+Encapsulate low-level Google GenAI API communication. Acts as the interface gateway between backend ingestion code and your active Gemini Vision models.
 
 ## Input
 
 ```python
-UploadedDocument
-```
+UploadedDocument  # Complete validation instance carrying local file_path mappings
 
----
+```
 
 ## Output
 
-Validated extraction response:
+Validated response payload wrapped inside an internal Pydantic structural model definition:
 
 ```python
 {
-  "fields": {},
-  "confidence": 0.95,
-  "quality_flags": [],
-  "status": "OK"
+  "fields": {},             # Dynamically extracted medical context data dictionary
+  "confidence": 1.0,        # Calculated extraction engine performance weight
+  "quality_flags": [],      # Diagnostic structural warnings arrays
+  "status": "OK"            # 'OK', 'PARTIAL', or 'FAILED'
 }
-```
 
----
+```
 
 ## Validation
 
-All Gemini outputs are validated through:
-
-```python
-ExtractionResponse
-```
-
-Pydantic schema.
-
----
+All raw unstructured JSON characters returned over remote model generation endpoints are cleaned of markdown block ticks and run through strict schema validation against an internal `ExtractionResponse` configuration blueprint.
 
 ## Failure Behavior
 
-Malformed JSON
-
-Timeout
-
-API Error
-
-Invalid schema
-
-Result:
-
-```python
-status = FAILED
-```
-
-Returned to ExtractionAgent.
+Malformed string serialization outputs, schema initialization validation anomalies, or persistent connection timeouts return a structured recovery payload marking `status = "FAILED"` containing an explicit description string passed directly back up to the caller.
 
 ---
 
@@ -578,20 +333,15 @@ Returned to ExtractionAgent.
 
 ## Responsibility
 
-Coordinate all stages.
-
-Single source of workflow execution.
-
----
+Orchestrate and coordinate sequential execution boundaries across all registered processing agents.
 
 ## Input
 
 ```python
-ClaimSubmission
-PolicyTerms
-```
+ClaimSubmission  # Instantiated body model unpacked from multiform boundaries
+PolicyTerms      # Current static global rules metadata mapping configuration
 
----
+```
 
 ## Workflow
 
@@ -607,56 +357,32 @@ Rules Engine
 Fraud Detector
         ↓
 Decision Synthesizer
-```
 
----
+```
 
 ## Output
 
 ```python
-ClaimContext
+ClaimContext     # Fully populated, serialized context dictionary object payload
+
 ```
-
-Fully populated.
-
----
 
 ## Failure Behavior
 
-Agent failures are isolated.
-
-Pipeline attempts to continue whenever safe.
-
-Final fallback:
-
-```python
-MANUAL_REVIEW
-```
-
-instead of system failure.
+Ensures complete process isolation. Individual agent component errors are captured locally, preventing pipeline cascading. Any unhandled terminal breakdown automatically defaults the execution track into an explainable `MANUAL_REVIEW` operational routing state.
 
 ---
 
 # Confidence Scoring
 
-Confidence is derived from:
+Confidence is computed deterministically by `app/utils/confidence.py -> calculate_pipeline_confidence(ctx)`.
 
-* Extraction quality
-* Failed documents
-* Fraud score
-* Pipeline degradation state
-* Blocked claims
+### Calculation Matrix
 
-Range:
+* **Baseline starting point**: Derived from the mean of all successful document extractions. If no files were parsed, defaults to a safe threshold of `0.70`.
+* **Failed Extractions**: `-0.10` penalty per document returning a status of `"FAILED"`.
+* **Degraded State**: `-0.20` penalty applied if an unhandled block exception triggers `ctx.degraded = True`.
+* **Fraud Risk**: Dynamic fractional subtraction deduction calculated as `-(fraud_score * 0.20)`.
+* **Blocked Target Exception**: Immediately caps the aggregate score output to a maximum threshold limit of `0.40`.
 
-```python
-0.0 - 1.0
-```
-
-Used by:
-
-```python
-DecisionSynthesizerAgent
-```
-
-to determine trust in automated decisions.
+Clamped strictly within the bounds of `[0.0, 1.0]`. SURFACED clearly via user interface elements to provide adjustable human-in-the-loop audit transparency.

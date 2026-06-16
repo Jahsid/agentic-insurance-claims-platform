@@ -1,15 +1,37 @@
 """
-Document models: what comes in (the raw upload) and what comes out
-of the Extraction Agent (structured, validated fields per doc type).
+Document models.
 
-DocumentQuality / extraction confidence flow into the overall
-decision confidence score (see decision.py).
+Defines:
+- Uploaded document metadata
+- Document classification types
+- Extraction schemas
+- Extraction results
+
+Supports two modes:
+
+1. Evaluation Mode
+   - test_cases.json provides:
+       actual_type
+       content
+   - bypasses Gemini extraction
+
+2. Production Mode
+   - real PDF/JPG/PNG uploads
+   - file stored locally/cloud
+   - Gemini Vision extracts structured data
 """
+
 from __future__ import annotations
 
 from enum import Enum
 from typing import Optional
+
 from pydantic import BaseModel, Field
+
+
+# ============================================================================
+# Document Types
+# ============================================================================
 
 
 class DocumentType(str, Enum):
@@ -23,24 +45,61 @@ class DocumentType(str, Enum):
     UNKNOWN = "UNKNOWN"
 
 
+# ============================================================================
+# Document Quality
+# ============================================================================
+
+
 class DocumentQuality(str, Enum):
     GOOD = "GOOD"
-    PARTIAL = "PARTIAL"          # some fields unreadable
-    UNREADABLE = "UNREADABLE"    # whole document unusable
+    PARTIAL = "PARTIAL"
+    UNREADABLE = "UNREADABLE"
+
+
+# ============================================================================
+# Uploaded Document
+# ============================================================================
 
 
 class UploadedDocument(BaseModel):
-    """What the client sends us for one uploaded file."""
+    """
+    Input document supplied with a claim.
+
+    Evaluation Mode:
+        actual_type + content supplied by test cases.
+
+    Production Mode:
+        file uploaded by member and stored on disk/cloud.
+    """
+
     file_id: str
+
     file_name: Optional[str] = None
-    # In production this would be a storage URI / base64 image.
-    # For the eval harness we also accept a pre-supplied `actual_type`
-    # and `content` (ground truth) to simulate extraction deterministically
-    # or to bypass the vision LLM during testing.
+
+    mime_type: Optional[str] = None
+    # Example:
+    # application/pdf
+    # image/jpeg
+    # image/png
+
+    file_path: Optional[str] = None
+    # Example:
+    # storage/uploads/claim_123_bill.pdf
+
     actual_type: Optional[DocumentType] = None
+
     quality: Optional[DocumentQuality] = None
+
     patient_name_on_doc: Optional[str] = None
+
     content: Optional[dict] = None
+    # Evaluation harness uses this directly
+    # instead of calling Gemini.
+
+
+# ============================================================================
+# Shared Extraction Models
+# ============================================================================
 
 
 class LineItem(BaseModel):
@@ -48,40 +107,94 @@ class LineItem(BaseModel):
     amount: float
 
 
+# ============================================================================
+# Prescription Schema
+# ============================================================================
+
+
 class ExtractedPrescription(BaseModel):
     doctor_name: Optional[str] = None
+
     doctor_registration: Optional[str] = None
+
     patient_name: Optional[str] = None
+
     date: Optional[str] = None
+
     diagnosis: Optional[str] = None
+
     treatment: Optional[str] = None
-    medicines: list[str] = []
-    tests_ordered: list[str] = []
+
+    medicines: list[str] = Field(default_factory=list)
+
+    tests_ordered: list[str] = Field(default_factory=list)
+
+
+# ============================================================================
+# Bill Schema
+# ============================================================================
 
 
 class ExtractedBill(BaseModel):
     hospital_name: Optional[str] = None
+
     patient_name: Optional[str] = None
+
     date: Optional[str] = None
-    line_items: list[LineItem] = []
+
+    line_items: list[LineItem] = Field(default_factory=list)
+
     total: Optional[float] = None
+
+
+# ============================================================================
+# Lab Report Schema
+# ============================================================================
 
 
 class ExtractedLabReport(BaseModel):
     lab_name: Optional[str] = None
+
     patient_name: Optional[str] = None
+
     sample_date: Optional[str] = None
+
     report_date: Optional[str] = None
-    tests: list[dict] = []
+
+    tests: list[dict] = Field(default_factory=list)
+
     remarks: Optional[str] = None
 
 
+# ============================================================================
+# Extraction Result
+# ============================================================================
+
+
 class DocumentExtractionResult(BaseModel):
-    """Output of the Extraction Agent for a single document."""
+    """
+    Output produced by ExtractionAgent.
+    """
+
     file_id: str
+
     document_type: DocumentType
+
     extracted_fields: dict = Field(default_factory=dict)
-    confidence: float = Field(ge=0.0, le=1.0)
-    quality_flags: list[str] = Field(default_factory=list)
-    extraction_status: str = "OK"  # OK | PARTIAL | FAILED
+
+    confidence: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
+
+    quality_flags: list[str] = Field(
+        default_factory=list
+    )
+
+    extraction_status: str = "OK"
+    # OK
+    # PARTIAL
+    # FAILED
+
     error: Optional[str] = None

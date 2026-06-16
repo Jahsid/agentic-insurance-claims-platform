@@ -12,32 +12,14 @@ class DocumentClassificationError(AgentError):
 
 class DocumentClassifierAgent(BaseAgent):
     """
-    Classifies uploaded documents before verification.
+    Stage 1:
+        Document Classification
 
-    Purpose:
-        - Determine actual document type if missing.
-        - Support live uploads where users provide arbitrary PDFs/images.
-        - Improve document verification quality.
-
-    Safe behavior:
-        - If actual_type already exists, do not overwrite it.
-        - If classification fails, mark UNKNOWN and continue.
-
-    Component contract
-    -------------------
-    Input:  ClaimContext.submission.documents (list[UploadedDocument])
-    Output: mutates doc.actual_type in place for any document where it
-            was previously None. Documents that already carry an
-            actual_type (e.g. from the eval harness / test_cases.json,
-            which supplies ground-truth types) are left untouched.
-    Raises: nothing (BaseAgent.run_safe wraps unexpected errors; internal
-            classification failures are caught per-document and mapped
-            to DocumentType.UNKNOWN rather than raising).
-
-    Pipeline placement: runs BEFORE DocumentVerifierAgent (stage 0), so
-    that the verifier's required-document-type check has a populated
-    actual_type to work with even for live uploads where the client did
-    not supply one.
+    Responsibilities:
+    - Detect document type
+    - Populate ctx.classified_documents
+    - Support evaluation mode
+    - Support future Gemini Vision classification
     """
 
     name = "DocumentClassifierAgent"
@@ -51,12 +33,23 @@ class DocumentClassifierAgent(BaseAgent):
         classified = []
         unknown = []
 
+        classification_results = {}
+
         for doc in ctx.submission.documents:
 
-            # -------------------------------------------------
-            # Keep existing type from test cases / eval harness
-            # -------------------------------------------------
+            # --------------------------------------------------
+            # Evaluation mode:
+            # actual_type already supplied
+            # --------------------------------------------------
+
             if doc.actual_type:
+
+                classification_results[doc.file_id] = {
+                    "predicted_type": doc.actual_type.value,
+                    "confidence": 1.0,
+                    "source": "provided",
+                }
+
                 classified.append(
                     {
                         "file_id": doc.file_id,
@@ -64,22 +57,39 @@ class DocumentClassifierAgent(BaseAgent):
                         "source": "provided",
                     }
                 )
+
                 continue
 
             try:
-                doc.actual_type = self._classify_document(doc)
+
+                predicted_type = self._classify_document(doc)
+
+                doc.actual_type = predicted_type
+
+                classification_results[doc.file_id] = {
+                    "predicted_type": predicted_type.value,
+                    "confidence": 0.90,
+                    "source": "classifier",
+                }
 
                 classified.append(
                     {
                         "file_id": doc.file_id,
-                        "type": doc.actual_type.value,
+                        "type": predicted_type.value,
                         "source": "classifier",
                     }
                 )
 
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
 
                 doc.actual_type = DocumentType.UNKNOWN
+
+                classification_results[doc.file_id] = {
+                    "predicted_type": DocumentType.UNKNOWN.value,
+                    "confidence": 0.0,
+                    "source": "fallback",
+                    "error": str(exc),
+                }
 
                 unknown.append(doc.file_id)
 
@@ -100,27 +110,60 @@ class DocumentClassifierAgent(BaseAgent):
                     )
                 )
 
-        # -------------------------------------------------
-        # Trace summary
-        # -------------------------------------------------
+        # --------------------------------------------------
+        # Save results for API response
+        # --------------------------------------------------
+
+        ctx.classified_documents = classification_results
+
+        # --------------------------------------------------
+        # Metadata
+        # --------------------------------------------------
+
+        ctx.processing_metadata.update(
+            {
+                "documents_received": len(
+                    ctx.submission.documents
+                ),
+                "documents_classified": len(
+                    classified
+                ),
+                "documents_unknown": len(
+                    unknown
+                ),
+                "classification_engine": (
+                    "gemini"
+                    if self.llm_client
+                    else "rule_based"
+                ),
+            }
+        )
+
+        # --------------------------------------------------
+        # Trace
+        # --------------------------------------------------
 
         if unknown:
+
             ctx.add_trace(
                 TraceEntry(
                     stage=self.stage,
                     component=self.name,
                     status=TraceStatus.WARNING,
                     message=(
-                        f"{len(unknown)} document(s) could not "
-                        f"be classified."
+                        f"{len(unknown)} document(s) "
+                        f"could not be classified."
                     ),
                     details={
                         "unknown_documents": unknown,
+                        "classified_documents": classified,
                     },
                     confidence_impact=-0.05 * len(unknown),
                 )
             )
+
         else:
+
             ctx.add_trace(
                 TraceEntry(
                     stage=self.stage,
@@ -133,22 +176,28 @@ class DocumentClassifierAgent(BaseAgent):
                     details={
                         "classified_documents": classified,
                     },
+                    confidence_impact=0.0,
                 )
             )
 
         return ctx
 
-    def _classify_document(self, doc) -> DocumentType:
+    def _classify_document(
+        self,
+        doc,
+    ) -> DocumentType:
         """
-        Classification logic.
+        Classification priority:
 
-        Priority:
-        1. Content hints
-        2. Filename heuristics
-        3. LLM (future)
+        1. Filename heuristics
+        2. Content heuristics
+        3. Gemini Vision
+        4. UNKNOWN
         """
 
-        file_name = (doc.file_name or "").lower()
+        file_name = (
+            doc.file_name or ""
+        ).lower()
 
         # ------------------------------------------
         # Filename heuristics
@@ -173,12 +222,14 @@ class DocumentClassifierAgent(BaseAgent):
             return DocumentType.DISCHARGE_SUMMARY
 
         # ------------------------------------------
-        # Content hints
+        # Content heuristics
         # ------------------------------------------
 
         if getattr(doc, "content", None):
 
-            text_blob = str(doc.content).lower()
+            text_blob = str(
+                doc.content
+            ).lower()
 
             if "diagnosis" in text_blob:
                 return DocumentType.PRESCRIPTION
@@ -193,18 +244,26 @@ class DocumentClassifierAgent(BaseAgent):
                 return DocumentType.HOSPITAL_BILL
 
             if "admission_date" in text_blob:
-                return DocumentType.DISCHARGE_SUMMARY
+                return (
+                    DocumentType.DISCHARGE_SUMMARY
+                )
 
         # ------------------------------------------
-        # Future Gemini classification
+        # Gemini Vision
         # ------------------------------------------
 
         if self.llm_client:
 
             try:
-                prediction = self.llm_client.classify_document(doc)
 
-                return DocumentType(prediction)
+                prediction = (
+                    self.llm_client
+                    .classify_document(doc)
+                )
+
+                return DocumentType(
+                    prediction
+                )
 
             except Exception:
                 pass

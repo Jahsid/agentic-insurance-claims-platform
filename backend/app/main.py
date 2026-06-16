@@ -5,16 +5,11 @@ Responsibilities:
 - Create and configure the FastAPI application.
 - Register API routers.
 - Install global exception handlers.
-- Configure CORS for frontend applications.
-- Expose health/readiness endpoints through routers.
-- Keep orchestration/business logic outside the web layer.
-
-The claim-processing workflow itself lives in:
-    app.orchestrator.pipeline
-
-API routes should remain thin adapters that:
-    Request -> Pydantic Model -> Pipeline -> Response
+- Configure CORS.
+- Expose health/readiness endpoints.
+- Register upload endpoints.
 """
+
 from __future__ import annotations
 
 import logging
@@ -23,34 +18,35 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+# ------------------------------------------------------------------
 # Routers
+# ------------------------------------------------------------------
+
 try:
     from app.api.routes_health import router as health_router
 except ImportError:
     health_router = None
 
 from app.api.routes_claims import router as claims_router
+from app.api.routes_uploads import router as uploads_router
 
 logger = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
     """
-    Application factory.
-
-    Using a factory makes testing easier and allows future
-    environment-specific configuration without side effects
-    at import time.
+    Application Factory
     """
 
     app = FastAPI(
         title="Plum Claims Processing System",
         description=(
-            "Multi-stage explainable insurance claims processing "
-            "platform with document verification, extraction, "
-            "rules evaluation, fraud detection, and decision synthesis."
+            "Agentic insurance claims processing platform "
+            "with document verification, extraction, "
+            "rules evaluation, fraud detection, "
+            "and explainable decision synthesis."
         ),
-        version="1.0.0",
+        version="2.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
     )
@@ -58,12 +54,15 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     # CORS
     # ------------------------------------------------------------------
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
+            # Local Frontend
             "http://localhost:5173",
             "http://127.0.0.1:5173",
-             # Production frontend
+
+            # Vercel Production Frontend
             "https://agentic-insurance-claims-platform.vercel.app",
         ],
         allow_credentials=True,
@@ -74,6 +73,7 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------
     # Routers
     # ------------------------------------------------------------------
+
     if health_router:
         app.include_router(
             health_router,
@@ -86,14 +86,21 @@ def create_app() -> FastAPI:
         tags=["claims"],
     )
 
+    app.include_router(
+        uploads_router,
+        tags=["uploads"],
+    )
+
     # ------------------------------------------------------------------
-    # Global exception handling
+    # Global Exception Handler
     # ------------------------------------------------------------------
+
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(
         request: Request,
         exc: Exception,
     ) -> JSONResponse:
+
         logger.exception(
             "Unhandled exception during request %s %s",
             request.method,
@@ -105,21 +112,41 @@ def create_app() -> FastAPI:
             content={
                 "error": "INTERNAL_SERVER_ERROR",
                 "message": (
-                    "An unexpected error occurred while processing "
-                    "the request."
+                    "An unexpected error occurred while "
+                    "processing the request."
                 ),
             },
         )
 
     # ------------------------------------------------------------------
-    # Root endpoint
+    # Root Endpoint
     # ------------------------------------------------------------------
+
     @app.get("/", tags=["system"])
     async def root() -> dict:
         return {
             "service": "plum-claims",
             "status": "running",
-            "version": "1.0.0",
+            "version": "2.0.0",
+            "features": [
+                "document_verification",
+                "document_classification",
+                "policy_rules_engine",
+                "fraud_detection",
+                "decision_synthesis",
+                "real_file_uploads",
+                "explainable_trace",
+            ],
+        }
+
+    # ------------------------------------------------------------------
+    # Health Check
+    # ------------------------------------------------------------------
+
+    @app.get("/health", tags=["system"])
+    async def health() -> dict:
+        return {
+            "status": "healthy",
         }
 
     return app

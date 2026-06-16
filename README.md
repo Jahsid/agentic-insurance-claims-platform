@@ -1,5 +1,3 @@
-# Plum Health Insurance Claims Processing System
-
 ## Overview
 
 This project is an AI-assisted Health Insurance Claims Processing System
@@ -22,7 +20,9 @@ the full trace of every case.
 
 ## Repository layout
 
+
 ```
+
 .
 ├── README.md                  # this file
 ├── ARCHITECTURE.md             # design doc, trade-offs, scaling discussion
@@ -61,11 +61,12 @@ the full trace of every case.
 │           ├── test_cases.json    # the 12 assignment scenarios
 │           └── run_test_cases.py  # runs all 12, prints expected vs actual + trace
 └── frontend/
-    ├── package.json
-    └── src/
-        ├── pages/                 # SubmitClaim, ClaimResult
-        ├── components/            # DocumentUpload, DecisionCard, TraceViewer
-        └── api/client.ts
+├── package.json
+└── src/
+├── pages/                 # SubmitClaim, ClaimResult
+├── components/            # DocumentUpload, DecisionCard, TraceViewer
+└── api/client.ts
+
 ```
 
 ---
@@ -130,11 +131,7 @@ modes:
 1. **Passthrough** -- if the document already carries a `content` dict
    (the evaluation harness's ground-truth data), it's validated and used
    directly with confidence 0.95.
-2. **Gemini-powered** -- for live uploads, `LLMClient` sends a
-   document-type-specific prompt (see `app/llm/prompts/`) to Gemini and
-   validates the JSON response against `ExtractionResponse`
-   (`app/models/extraction_response.py`), which enforces `confidence in
-   [0,1]` and `status in {OK, PARTIAL, FAILED}`.
+2. **Gemini-powered** -- for live uploads over standard multi-part form data (`multipart/form-data`), binary streams are saved securely onto local disk staging (`storage/uploads/`), dynamically cast into `UploadedDocument` structural models, and sent directly to Gemini Vision for structured parsing.
 
 If an individual document fails extraction, it's marked
 `extraction_status = "FAILED"` with confidence 0 and the pipeline
@@ -212,7 +209,7 @@ signals, and pipeline confidence into a final `ClaimDecision`:
 - **MANUAL_REVIEW** -- any fraud signal present, fraud score over
   threshold, or claimed amount over the manual-review ceiling.
 - **PARTIAL** -- line items were excluded, or the eligible base amount
-  itself was reduced (e.g. by an annual-limit cap). Normal network
+  itsmselves was reduced (e.g. by an annual-limit cap). Normal network
   discount / co-pay arithmetic on the *full* eligible amount is **not**
   treated as partial -- that's the member's expected contractual share,
   so it's `APPROVED`.
@@ -230,23 +227,26 @@ reduced and `manual_review_recommended = True` with an explanatory note.
 Every claim produces a full ordered trace (`ctx.trace`, returned as
 `trace` in the API response), one entry per check:
 
+
 ```
+
 Document Classification
-        |
-        v
+|
+v
 Document Verification
-        |
-        v
+|
+v
 Extraction
-        |
-        v
+|
+v
 Eligibility -> Waiting Period -> Exclusions -> Pre-Auth -> Limits -> Coverage Calc
-        |
-        v
+|
+v
 Fraud Detection
-        |
-        v
+|
+v
 Decision Synthesis
+
 ```
 
 Each trace entry records `stage`, `component`, `status`
@@ -259,11 +259,14 @@ see exactly what was checked, what passed or failed, and why a decision
 
 ## Decision types
 
+
 ```
+
 APPROVED        -- full eligible amount payable
 PARTIAL         -- some items/amount excluded or capped
 REJECTED        -- one or more hard policy rules failed
 MANUAL_REVIEW   -- fraud/anomaly signal detected, needs human review
+
 ```
 
 Each non-blocked decision includes: `approved_amount`, `confidence_score`,
@@ -319,6 +322,7 @@ In all cases:
 - The pipeline **continues** with whatever partial data is available
   (the rules engine falls back to reading `content` directly from
   `ctx.submission.documents` if extraction didn't run).
+- **Transient API Recovery**: The `ExtractionAgent` incorporates an automated exponential backoff loop that automatically retries failed Gemini calls up to 3 times if the upstream server flags temporary 503 high-demand rate spikes.
 - The final decision is still produced, but with reduced confidence and
   `manual_review_recommended = True`.
 - **No exception ever propagates to the API as a 500** for a pipeline
@@ -331,7 +335,7 @@ In all cases:
 
 **Backend:** Python 3.11+, FastAPI, Pydantic v2, Uvicorn, python-dotenv.
 
-**AI / extraction:** Google Gemini (`google-generativeai`), prompt-based
+**AI / extraction:** Google Gemini (`google-genai` modern SDK), prompt-based
 per-document-type extraction, structured-output validation via Pydantic.
 
 **Frontend:** React, TypeScript, Vite, Tailwind.
@@ -346,10 +350,11 @@ per-document-type extraction, structured-output validation via Pydantic.
 # from the repo root
 cp backend/.env.example backend/.env   # optional: add GEMINI_API_KEY for live extraction
 docker compose up --build
+
 ```
 
-- Backend: http://localhost:8000 (Swagger UI at `/docs`)
-- Frontend: http://localhost:5173
+* Backend: http://localhost:8000 (Swagger UI at `/docs`)
+* Frontend: http://localhost:5173
 
 ### Option B: Run locally
 
@@ -361,10 +366,11 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 uvicorn app.main:app --reload
+
 ```
 
-- API: http://localhost:8000
-- Swagger UI: http://localhost:8000/docs
+* API: http://localhost:8000
+* Swagger UI: http://localhost:8000/docs
 
 **Frontend**
 
@@ -372,18 +378,18 @@ uvicorn app.main:app --reload
 cd frontend
 npm install
 npm run dev
+
 ```
 
-- App: http://localhost:5173
+* App: http://localhost:5173
 
 ### Configuration
 
-All environment variables are read once via `app/config.py ->
-get_settings()`. Copy `backend/.env.example` to `backend/.env` and adjust
+All environment variables are read once via `app/config.py -> get_settings()`. Copy `backend/.env.example` to `backend/.env` and adjust
 as needed:
 
 | Variable | Default | Purpose |
-|---|---|---|
+| --- | --- | --- |
 | `ENVIRONMENT` | `development` | development / staging / production |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 | `HOST` / `PORT` | `0.0.0.0` / `8000` | uvicorn bind address |
@@ -408,6 +414,7 @@ pytest tests/unit -v
 
 # run all 12 assignment scenarios, with expected-vs-actual + full trace
 python tests/eval/run_test_cases.py
+
 ```
 
 `run_test_cases.py` prints, for each of the 12 cases: the expected
@@ -454,16 +461,15 @@ Limitations* section of `EVAL_REPORT.md`.
 
 ## Future improvements
 
-- Gemini Vision-based document classification (current classifier uses
-  filename/content heuristics with an LLM hook for the future)
-- Native PDF/multi-page image handling in the extraction pipeline
-- Postgres persistence layer (currently an in-memory dict in
-  `routes_claims.py`)
-- Async/queued extraction for higher throughput
-- Retry and fallback models for the LLM extraction path
-- Human-in-the-loop review UI for `MANUAL_REVIEW` claims
-- Production monitoring/metrics on trace outcomes and confidence
-  distributions
+* Gemini Vision-based document classification (current classifier uses
+filename/content heuristics with an LLM hook for the future)
+* Native PDF/multi-page image handling in the extraction pipeline
+* Postgres persistence layer (currently an in-memory dict in
+`routes_claims.py`)
+* Async/queued extraction for higher throughput
+* Human-in-the-loop review UI for `MANUAL_REVIEW` claims
+* Production monitoring/metrics on trace outcomes and confidence
+distributions
 
 ---
 

@@ -1,81 +1,82 @@
+// Parts of frontend/src/pages/SubmitClaim.tsx
 import { useState } from "react";
-
 import api from "../api/client";
-import DocumentUpload from "../components/DocumentUpload";
+import DocumentUpload, { type UploadedDocument } from "../components/DocumentUpload";
 import ClaimResult from "./ClaimResult";
 
 export default function SubmitClaim() {
-  const [loading, setLoading] =
-    useState(false);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<any>(null);
+  
+  const [documents, setDocuments] = useState<UploadedDocument[]>([
+    { file_id: crypto.randomUUID(), actual_type: "PRESCRIPTION", fileObject: null },
+    { file_id: crypto.randomUUID(), actual_type: "HOSPITAL_BILL", fileObject: null },
+  ]);
 
-  const [result, setResult] =
-    useState<any>(null);
+  const [formData, setFormData] = useState({
+    member_id: "EMP001",
+    policy_id: "PLUM_GHI_2024",
+    claim_category: "CONSULTATION",
+    treatment_date: "2024-10-01",
+    claimed_amount: 1000,
+    hospital_name: "Apollo Hospitals",
+  });
 
-  const [documents, setDocuments] =
-    useState<any[]>([
-      {
-        file_id: crypto.randomUUID(),
-        actual_type: "PRESCRIPTION",
-      },
-      {
-        file_id: crypto.randomUUID(),
-        actual_type: "HOSPITAL_BILL",
-      },
-    ]);
-
-  const [formData, setFormData] =
-    useState({
-      member_id: "EMP001",
-      policy_id: "PLUM_GHI_2024",
-      claim_category: "CONSULTATION",
-      treatment_date: "2024-10-01",
-      claimed_amount: 1000,
-      hospital_name: "",
-    });
-
-  const handleChange = (
-    e: React.ChangeEvent<
-      HTMLInputElement | HTMLSelectElement
-    >,
-  ) => {
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
-
     setFormData((prev) => ({
       ...prev,
-      [name]:
-        name === "claimed_amount"
-          ? Number(value)
-          : value,
+      [name]: name === "claimed_amount" ? Number(value) : value,
     }));
   };
 
-  const handleSubmit = async (
-    e: React.FormEvent,
-  ) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Verification: Ensure files are selected for each document entry
+    const missingFiles = documents.some((doc) => !doc.fileObject);
+    if (missingFiles) {
+      alert("Please upload a physical file for all listed documents before submitting.");
+      return;
+    }
 
     try {
       setLoading(true);
 
-      const payload = {
-        ...formData,
-        documents,
-      };
+      // Create browser native multi-part form constructor
+      const multipartPayload = new FormData();
 
-      const response =
-        await api.post(
-          "/claims",
-          payload,
-        );
+      multipartPayload.append("member_id", formData.member_id);
+      multipartPayload.append("policy_id", formData.policy_id);
+      multipartPayload.append("claim_category", formData.claim_category);
+      multipartPayload.append("treatment_date", formData.treatment_date);
+      multipartPayload.append("claimed_amount", String(formData.claimed_amount));
+      multipartPayload.append("hospital_name", formData.hospital_name);
+
+      documents.forEach((doc, index) => {
+        if (doc.fileObject) {
+          // Append binary file object stream
+          multipartPayload.append("files", doc.fileObject);
+          
+          // Append meta mappings configuration (as JSON strings or structural matching)
+          multipartPayload.append(`document_metadata_${index}`, JSON.stringify({
+            file_id: doc.file_id,
+            actual_type: doc.actual_type,
+          }));
+        }
+      });
+
+      // Issue dynamic Axios network post over multiform configuration
+      const response = await api.post("/claims", multipartPayload, {
+        headers: {
+          "Content-Type": "multipart/form-data",
+        },
+      });
 
       setResult(response.data);
     } catch (error: any) {
       console.error(error);
-
-      alert(
-        error?.response?.data?.detail ||
-          "Claim submission failed",
-      );
+      alert(error?.response?.data?.detail || "Claim submission pipeline error");
     } finally {
       setLoading(false);
     }

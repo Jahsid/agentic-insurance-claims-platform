@@ -17,48 +17,51 @@ reads from and writes to that context, and appends entries to an ordered
 `trace` list as it goes. The trace *is* the explainability deliverable --
 nothing is hidden inside a stage's internal state.
 
+
 ```
+
 ClaimSubmission
-      |
-      v
+|
+v
 +----------------------------+
-| Stage 0: Document           |  infers actual_type for live uploads
-| Classification               |  (no-op when eval harness supplies it)
+| Stage 0: Document          |  infers actual_type for live uploads
+| Classification             |  (no-op when eval harness supplies it)
 +----------------------------+
-      |
-      v
+|
+v
 +----------------------------+
-| Stage 1: Document            |  readability -> required types ->
-| Verification (can BLOCK)      |  patient-identity consistency
+| Stage 1: Document          |  readability -> required types ->
+| Verification (can BLOCK)   |  patient-identity consistency
 +----------------------------+
-      |  (blocked? return immediately)
-      v
+|  (blocked? return immediately)
+v
 +----------------------------+
-| Stage 2: Extraction           |  passthrough (eval) or Gemini (live);
-|                               |  per-document confidence + status
+| Stage 2: Extraction        |  passthrough (eval) or Gemini (live);
+|                            |  per-document confidence + status
 +----------------------------+
-      |
-      v
+|
+v
 +----------------------------+
-| Stage 3: Rules Engine         |  eligibility -> waiting period ->
+| Stage 3: Rules Engine      |  eligibility -> waiting period ->
 | (deterministic, pure function)|  exclusions -> pre-auth -> limits ->
-|                               |  coverage calculation
+|                            |  coverage calculation
 +----------------------------+
-      |
-      v
+|
+v
 +----------------------------+
-| Stage 4: Fraud Detection       |  same-day / monthly claim counts,
-|                               |  high-value threshold
+| Stage 4: Fraud Detection   |  same-day / monthly claim counts,
+|                            |  high-value threshold
 +----------------------------+
-      |
-      v
+|
+v
 +----------------------------+
-| Stage 5: Decision Synthesis    |  combines everything into
-|                               |  ClaimDecision + confidence_score
+| Stage 5: Decision Synthesis|  combines everything into
+|                            |  ClaimDecision + confidence_score
 +----------------------------+
-      |
-      v
+|
+v
 ClaimContext (decision + full trace) -> API response
+
 ```
 
 Two structural choices anchor everything else:
@@ -140,8 +143,7 @@ data.
 
 ## 4. Why separate agents with a `run_safe` boundary?
 
-Each of the five (now six, with classification) stages is its own class
-extending `BaseAgent`, with:
+Each of the stages is its own class extending `BaseAgent`, with:
 
 - a `name` and `stage` identifier (used in trace entries),
 - a `run(ctx) -> ctx` method containing the actual logic,
@@ -307,21 +309,14 @@ better than less.
 ## 6. Failure handling and graceful degradation
 
 The system assumes failures *will* happen -- LLM timeouts, malformed
-model output, transient bugs in a rules module -- and is built so that
+model output, transient waves of 503 unavailability -- and is built so that
 none of them produce a 500 or an unexplainable result.
 
-**Two layers of defense:**
+**Three layers of defense:**
 
-1. **`BaseAgent.run_safe`** wraps every agent (`DocumentClassifierAgent`,
-   `DocumentVerifierAgent`, `ExtractionAgent`, `FraudDetectorAgent`,
-   `DecisionSynthesizerAgent`). Any exception becomes a `FAIL` trace entry
-   + `ctx.degraded = True` + a `-0.25` confidence penalty, and the
-   pipeline continues.
-2. **The orchestrator wraps the rules engine** (`evaluate_rules`)
-   separately, since it's a plain function rather than a `BaseAgent`. If
-   it raises, the orchestrator builds an empty `RulesEvaluationResult`,
-   logs a `FAIL` trace entry with a `-0.3` confidence penalty, and
-   continues to fraud detection and decision synthesis.
+1. **`BaseAgent.run_safe`** wraps every agent. Any unhandled exception becomes a `FAIL` trace entry + `ctx.degraded = True` + a `-0.25` confidence penalty, and the pipeline continues.
+2. **Transient API Recovery**: The `ExtractionAgent` incorporates an automated exponential backoff loop that automatically intercepts and retries failed Gemini calls up to 3 times if the upstream server flags temporary 503 high-demand rate spikes, preventing unnecessary context degradation.
+3. **The orchestrator wraps the rules engine** (`evaluate_rules`) separately, since it's a plain function rather than a `BaseAgent`. If it raises, the orchestrator builds an empty `RulesEvaluationResult`, logs a `FAIL` trace entry with a `-0.3` confidence penalty, and continues to fraud detection and decision synthesis.
 
 **The data-fallback path (TC011):** if `ExtractionAgent` fails entirely
 (`ctx.extractions = []`), the rules engine's `_gather_text_fields` helper
@@ -378,9 +373,7 @@ returns the decision in the response. At 10x volume, LLM extraction
 latency (seconds per document) would make this a poor fit for a
 request/response API. The natural evolution:
 
-- `POST /claims` validates the submission, persists it, enqueues a job
-  (e.g. via Celery/RQ + Redis, or SQS), and returns `202 Accepted` with a
-  `claim_id`.
+- `POST /claims` ingests binary streams over multipart data paths, buffers them securely to disk (`storage/uploads/`), validates the parameters, enqueues an asynchronous background task (e.g. via Celery/RQ + Redis, or SQS), and returns `202 Accepted` with a `claim_id`.
 - A worker pool runs `run_claim_pipeline` per job and persists the
   resulting `ClaimContext` (decision + trace).
 - `GET /claims/{claim_id}` (already present in `routes_claims.py`) becomes
@@ -451,3 +444,9 @@ architectural decisions in Sections 2-5 (shared context per claim,
 deterministic policy logic, per-agent failure isolation) were chosen
 specifically so that the *scaling* story is "add more workers / queue
 depth", not "redesign the decision logic".
+
+---
+
+## Author
+
+AI Engineer Assignment submission for Plum.
