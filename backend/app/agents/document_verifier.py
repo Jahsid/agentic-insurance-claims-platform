@@ -1,41 +1,24 @@
 """
 DocumentVerifierAgent
 
-Runs BEFORE any extraction or decisioning. Performs three checks, in order:
+Runs BEFORE any execution or decisioning logic. Performs three checks, in order:
 
-1. TYPE CHECK (TC001): are the required document types for this
+1. READABILITY CHECK (TC002): If any document is flagged UNREADABLE,
+   stop and ask the member to re-upload that *specific* document —
+   do not reject the whole claim outright.
+
+2. TYPE CHECK (TC001): Are the required document types for this
    claim_category present among the uploaded documents? If a required
    type is missing, but the member uploaded something else instead
    (e.g. two prescriptions when a hospital bill was required), the
    message must name both what was uploaded and what is still needed.
 
-2. READABILITY CHECK (TC002): if any document is flagged UNREADABLE,
-   stop and ask the member to re-upload that *specific* document —
-   do not reject the whole claim outright.
-
-3. PATIENT IDENTITY CHECK (TC003): if multiple documents carry a
-   `patient_name_on_doc` (or extracted patient_name) and they disagree,
-   stop and surface the specific names found on each document.
+3. PATIENT IDENTITY CHECK (TC003): If multiple documents carry a
+   `patient_name_on_doc` (or raw extracted patient name fields) and they disagree,
+   stop, block processing immediately, and surface the names found across documents.
 
 Any failure here sets ctx.blocked = True, ctx.block_code, and
-ctx.block_message, and the orchestrator must not proceed to extraction
-or the rules engine.
-
-Component contract
--------------------
-Input:  ClaimContext.submission (claim_category, documents[])
-        PolicyTerms.document_requirements[claim_category]
-Output: ClaimContext with one of:
-          - document_check_passed=True, blocked=False
-          - blocked=True, block_code in {
-                "MISSING_REQUIRED_DOCUMENT",
-                "UNREADABLE_DOCUMENT",
-                "PATIENT_MISMATCH",
-            }, block_message=<specific actionable text>
-Raises: DocumentVerificationError on malformed input (e.g. unknown
-        claim_category not present in policy.document_requirements).
-        This propagates up through BaseAgent.run_safe(), which converts
-        it into a degraded trace entry rather than crashing.
+ctx.block_message, guaranteeing that downstream engine adjustments are skipped.
 """
 from __future__ import annotations
 
@@ -73,7 +56,7 @@ class DocumentVerifierAgent(BaseAgent):
             for d in sub.documents
         ]
 
-        # --- 1. Readability check -------------------------------------
+        # --- 1. Readability Check (TC002) -------------------------------------
         unreadable = [d for d in sub.documents if d.quality == DocumentQuality.UNREADABLE]
         if unreadable:
             names = ", ".join(d.file_name or d.file_id for d in unreadable)
@@ -100,7 +83,7 @@ class DocumentVerifierAgent(BaseAgent):
             )
             return ctx
 
-        # --- 2. Required document type check ---------------------------
+        # --- 2. Required Document Type Check (TC001) ---------------------------
         missing = [req for req in requirements.required if req not in uploaded_types]
         if missing:
             uploaded_desc = ", ".join(uploaded_types) if uploaded_types else "no documents"
@@ -130,22 +113,36 @@ class DocumentVerifierAgent(BaseAgent):
             )
             return ctx
 
-        # --- 3. Patient identity consistency check ----------------------
-        named_docs = [
-            (d.file_id, d.actual_type.value if d.actual_type else "document", d.patient_name_on_doc)
-            for d in sub.documents
-            if d.patient_name_on_doc
-        ]
-        distinct_names = {n for _, _, n in named_docs}
+        # --- 3. Patient Identity Consistency Check (TC003) ----------------------
+        named_docs = []
+        
+        # Pull names from the pre-declared model tracking records
+        for d in sub.documents:
+            name_on_doc = getattr(d, "patient_name_on_doc", None) or (d.get("patient_name_on_doc") if isinstance(d, dict) else None)
+            if name_on_doc:
+                named_docs.append((d.file_id, d.actual_type.value if d.actual_type else "document", name_on_doc))
+
+        # Cross-reference with extractions list if it ran asynchronously or was pre-populated
+        if getattr(ctx, "extractions", None):
+            for ex in ctx.extractions:
+                fields = ex.extracted_fields or {}
+                extracted_name = fields.get("patient_name") or fields.get("patient_name_on_doc")
+                if extracted_name:
+                    # Avoid duplications for the same file ID
+                    if not any(item[0] == ex.file_id for item in named_docs):
+                        named_docs.append((ex.file_id, ex.document_type.value if ex.document_type else "document", extracted_name))
+
+        # Normalize names (strip whitespace, lowercase) to prevent false mismatches
+        distinct_names = {name.strip().lower() for _, _, name in named_docs}
+        
         if len(distinct_names) > 1:
             detail_str = "; ".join(
-                f"{doc_type} ({file_id}) is for {name}" for file_id, doc_type, name in named_docs
+                f"{doc_type} is for {name}" for _, doc_type, name in named_docs
             )
             message = (
-                f"The documents you uploaded appear to belong to different people: "
-                f"{detail_str}. Claims can only be processed if all documents are for "
-                f"the same patient. Please check and re-upload matching documents, or "
-                f"submit a separate claim for the other person."
+                f"The documents you uploaded appear to belong to different people: {detail_str}. "
+                f"Claims can only be processed if all documents are for the same patient. "
+                f"Please check and re-upload matching documents, or submit a separate claim for the other person."
             )
             ctx.blocked = True
             ctx.block_code = "PATIENT_MISMATCH"
@@ -161,7 +158,7 @@ class DocumentVerifierAgent(BaseAgent):
             )
             return ctx
 
-        # --- All checks passed -------------------------------------------
+        # --- All Checks Passed Successfully -------------------------------------------
         ctx.document_check_passed = True
         ctx.add_trace(
             TraceEntry(
